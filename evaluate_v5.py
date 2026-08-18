@@ -213,6 +213,10 @@ def sanitize_target_paths(paths):
     }
 
 
+def _test_entity_mask(df):
+    return df["TEST_ENTITY"].map(_cell_value).notna()
+
+
 def _has_dessteps(df):
     return df["TEST_ENTITY"].notna().any() and (
         df["TEST_ENTITY"].astype(str).str.strip().str.upper() == "DESSTEPS"
@@ -293,13 +297,12 @@ def get_metadata_for_run_id(run_id, df):
     metadata = _row_to_fields(df.iloc[0], COMMON_METADATA_COLUMNS)
     metadata["RUNID"] = str(run_id)
 
-    desstep_mask = df["TEST_ENTITY"].notna() & (
-        df["TEST_ENTITY"].astype(str).str.strip().str.upper() == "DESSTEPS"
-    )
-    metadata["design_steps"] = [
-        _row_to_fields(row, DESIGN_STEP_COLUMNS)
-        for _, row in df[desstep_mask].iterrows()
-    ]
+    test_entity_rows = df[_test_entity_mask(df)]
+    if not test_entity_rows.empty:
+        metadata["design_steps"] = [
+            _row_to_fields(row, DESIGN_STEP_COLUMNS)
+            for _, row in test_entity_rows.iterrows()
+        ]
     return metadata
 
 
