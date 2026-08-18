@@ -60,6 +60,11 @@ TARGET_DESIGN_STEP_PATH_COLUMNS = [
 ]
 
 PATH_RAW_COLUMNS = {"RUNID"}
+SOURCE_PATH_VALUE_OVERRIDES = {
+    "ENTITY": {
+        "TESTPLAN": "TEST",
+    }
+}
 
 INVALID_PATH_CHARS = re.compile(r'[<>:"|?*\\/\x00-\x1f]')
 MULTI_UNDERSCORE = re.compile(r"_+")
@@ -150,23 +155,30 @@ def _row_to_fields(row, columns):
     return {column: _cell_value(row.get(column)) for column in columns}
 
 
-def _path_segment(row, column, lowercase=True):
+def _path_segment(row, column, lowercase=True, value_overrides=None):
     value = _cell_value(row.get(column))
     if value is None:
         return None
     value = str(value)
+    if value_overrides:
+        value = value_overrides.get(column, {}).get(value.upper(), value)
     if column in PATH_RAW_COLUMNS:
         return value
     transformed = value.lower() if lowercase else value.upper()
     return reformat_string(transformed)
 
 
-def build_relative_path(row, columns, lowercase=True):
+def build_relative_path(row, columns, lowercase=True, value_overrides=None):
     if not columns:
         return None
     segments = []
     for column in columns:
-        segment = _path_segment(row, column, lowercase=lowercase)
+        segment = _path_segment(
+            row,
+            column,
+            lowercase=lowercase,
+            value_overrides=value_overrides,
+        )
         if segment is None:
             return None
         segments.extend(part for part in segment.split("/") if part)
@@ -209,13 +221,23 @@ def generate_paths(df):
         desstep_row = df.loc[
             df["TEST_ENTITY"].astype(str).str.strip().str.upper() == "DESSTEPS"
         ].iloc[0]
-        source_design_step_path = build_relative_path(desstep_row, SOURCE_DESIGN_STEP_PATH_COLUMNS, lowercase=False)
+        source_design_step_path = build_relative_path(
+            desstep_row,
+            SOURCE_DESIGN_STEP_PATH_COLUMNS,
+            lowercase=False,
+            value_overrides=SOURCE_PATH_VALUE_OVERRIDES,
+        )
         target_design_step_path = build_relative_path(desstep_row, TARGET_DESIGN_STEP_PATH_COLUMNS)
         if source_design_step_path and target_design_step_path:
             copy_pairs.append((source_design_step_path, target_design_step_path))
             target_attachment_paths.append(target_design_step_path)
 
-    source_path = build_relative_path(row, SOURCE_PATH_COLUMNS, lowercase=False)
+    source_path = build_relative_path(
+        row,
+        SOURCE_PATH_COLUMNS,
+        lowercase=False,
+        value_overrides=SOURCE_PATH_VALUE_OVERRIDES,
+    )
     target_path = build_relative_path(row, TARGET_PATH_COLUMNS)
     if source_path and target_path:
         copy_pairs.append((source_path, target_path))
@@ -277,12 +299,26 @@ def get_metadata_for_run_id(run_id, df):
 def copy_files_to_target(source_attachment_path, target_attachment_path):
     source_root = os.path.join(SOURCE_ROOT_DIR, source_attachment_path)
     target_root = resolve_target_path(target_attachment_path)
+    result = {
+        "source_path": source_root,
+        "target_path": target_root,
+        "source_file_count": 0,
+        "source_file_path_size": 0,
+        "target_file_count": 0,
+        "target_file_path_size": 0,
+    }
 
     if not os.path.exists(source_root):
-        return None
+        if os.path.exists(target_root):
+            result["target_file_count"] = len(os.listdir(target_root))
+            result["target_file_path_size"] = sum(
+                os.path.getsize(os.path.join(target_root, file))
+                for file in os.listdir(target_root)
+            )
+        return result
 
-    source_file_count = len(os.listdir(source_root))
-    source_file_path_size = sum(
+    result["source_file_count"] = len(os.listdir(source_root))
+    result["source_file_path_size"] = sum(
         os.path.getsize(os.path.join(source_root, file)) for file in os.listdir(source_root)
     )
 
@@ -292,21 +328,18 @@ def copy_files_to_target(source_attachment_path, target_attachment_path):
             os.path.join(target_root, file),
         )
 
-    target_file_count = len(os.listdir(target_root))
-    target_file_path_size = sum(
+    result["target_file_count"] = len(os.listdir(target_root))
+    result["target_file_path_size"] = sum(
         os.path.getsize(os.path.join(target_root, file)) for file in os.listdir(target_root)
     )
 
-    return {
-        "source_file_count": source_file_count,
-        "source_file_path_size": source_file_path_size,
-        "target_file_count": target_file_count,
-        "target_file_path_size": target_file_path_size,
-    }
+    return result
 
 
 def write_mismatch_report(
     run_id,
+    source_path,
+    target_path,
     source_file_count,
     source_file_path_size,
     target_file_count,
@@ -319,6 +352,8 @@ def write_mismatch_report(
             writer.writerow(
                 [
                     run_id,
+                    source_path,
+                    target_path,
                     source_file_count,
                     source_file_path_size,
                     target_file_count,
@@ -330,10 +365,11 @@ def write_mismatch_report(
 class ProcessedRunTracker:
     """Tracks processed run IDs using an in-memory set backed by a JSON file."""
 
-    def __init__(self, checkpoint_path: str):
+    def __init__(self, checkpoint_path: str, total_count: int = 0):
         self._path = checkpoint_path
         self._lock = threading.Lock()
         self._dirty_count = 0
+        self._total_count = total_count
 
         if os.path.exists(checkpoint_path):
             with open(checkpoint_path) as f:
@@ -344,8 +380,24 @@ class ProcessedRunTracker:
             self._success: set[str] = set()
             self._failed: set[str] = set()
 
+    def set_total_count(self, total_count: int) -> None:
+        with self._lock:
+            self._total_count = total_count
+
     def get_processed_run_ids(self) -> set[str]:
         return self._success
+
+    @property
+    def processed_count(self) -> int:
+        return len(self._success)
+
+    @property
+    def failed_count(self) -> int:
+        return len(self._failed)
+
+    @property
+    def remaining_count(self) -> int:
+        return max(0, self._total_count - len(self._success))
 
     def is_processed(self, run_id) -> bool:
         return str(run_id) in self._success
@@ -355,6 +407,7 @@ class ProcessedRunTracker:
             self._success.add(str(run_id))
             self._failed.discard(str(run_id))
             self._dirty_count += 1
+            self._print_progress(run_id, "success")
             if self._dirty_count >= CHECKPOINT_FLUSH_INTERVAL:
                 self._flush_unlocked()
 
@@ -362,13 +415,30 @@ class ProcessedRunTracker:
         with self._lock:
             self._failed.add(str(run_id))
             self._dirty_count += 1
+            self._print_progress(run_id, "failed")
             if self._dirty_count >= CHECKPOINT_FLUSH_INTERVAL:
                 self._flush_unlocked()
+
+    def _print_progress(self, run_id, status: str) -> None:
+        print(
+            f"[{status}] run_id={run_id} | "
+            f"processed={len(self._success)}, "
+            f"failed={len(self._failed)}, "
+            f"remaining={max(0, self._total_count - len(self._success))}, "
+            f"total={self._total_count}"
+        )
 
     def _flush_unlocked(self) -> None:
         with open(self._path, "w") as f:
             json.dump(
-                {"success": sorted(self._success), "failed": sorted(self._failed)},
+                {
+                    "total_count": self._total_count,
+                    "processed_count": len(self._success),
+                    "failed_count": len(self._failed),
+                    "remaining_count": max(0, self._total_count - len(self._success)),
+                    "success": sorted(self._success),
+                    "failed": sorted(self._failed),
+                },
                 f,
             )
         self._dirty_count = 0
@@ -405,17 +475,16 @@ def process_run_id(run_id, run_df, mismatch_report_path):
 
     for source_path, target_path in paths["copy_pairs"]:
         copy_result = copy_files_to_target(source_path, target_path)
-        if copy_result:
-            write_mismatch_report(
-                run_id,
-                copy_result["source_file_count"],
-                copy_result["source_file_path_size"],
-                copy_result["target_file_count"],
-                copy_result["target_file_path_size"],
-                mismatch_report_path,
-            )
-        else:
-            write_mismatch_report(run_id, 0, 0, 0, 0, mismatch_report_path)
+        write_mismatch_report(
+            run_id,
+            copy_result["source_path"],
+            copy_result["target_path"],
+            copy_result["source_file_count"],
+            copy_result["source_file_path_size"],
+            copy_result["target_file_count"],
+            copy_result["target_file_path_size"],
+            mismatch_report_path,
+        )
 
     return run_id
 
@@ -463,6 +532,8 @@ def init_mismatch_report(mismatch_report_path: str):
             writer.writerow(
                 [
                     "run_id",
+                    "source_path",
+                    "target_path",
                     "source_file_count",
                     "source_file_path_size",
                     "target_file_count",
@@ -558,9 +629,8 @@ def main():
     init_batch_timing_report(batch_timing_report_path)
 
     grouped_runs = load_master_data(args.csv_path)
-    tracker = ProcessedRunTracker(checkpoint_file)
-
     all_run_ids = list(grouped_runs.keys())
+    tracker = ProcessedRunTracker(checkpoint_file, total_count=len(all_run_ids))
     if args.resume:
         already_processed = tracker.get_processed_run_ids()
         pending_run_ids = [run_id for run_id in all_run_ids if str(run_id) not in already_processed]
